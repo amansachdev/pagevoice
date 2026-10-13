@@ -4,9 +4,10 @@ Pagevoice is a local PDF listening player for macOS. Open a book, jump to a page
 
 ## Features
 
-- PDF page navigation and sentence-level playback start
+- PDF page navigation in single-page or facing two-page view
+- Sentence-level playback start with sentence-accurate spoken highlighting
 - Play, pause, resume, skip, voice selection, and adjustable speed
-- Spoken sentence highlighting and saved reading position
+- Player stays visible while the document scrolls; reading position is saved
 - PDF rendering and progress stored in your browser
 - Local speech synthesis through Kokoro MLX
 

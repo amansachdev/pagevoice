@@ -1,12 +1,12 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent, type RefObject } from "react";
 import { getDocument, GlobalWorkerOptions, TextLayer } from "pdfjs-dist";
 import workerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 
 GlobalWorkerOptions.workerSrc = workerUrl;
 
-type TextItem = { str: string; hasEOL?: boolean };
+type TextItem = { str: string; hasEOL?: boolean; transform?: number[]; height?: number };
 type Sentence = { text: string; start: number; end: number };
-type PageData = { text: string; sentences: Sentence[]; itemRanges: Array<[number, number]> };
+type PageData = { text: string; sentences: Sentence[]; itemRanges: Array<[number, number]>; items: TextItem[] };
 type Voice = { id: string; label: string };
 type PlayerState = "idle" | "playing" | "paused" | "error";
 const DEFAULT_VOICE = "af_heart";
@@ -27,10 +27,35 @@ function splitSentences(text: string): Sentence[] {
   return sentences;
 }
 
+function orderItemsByPagePosition(items: TextItem[]) {
+  if (items.length < 2 || items.some((item) => !item.transform || item.transform.length < 6)) return items;
+  const positioned = items.map((item, index) => ({
+    item,
+    index,
+    x: item.transform![4],
+    y: item.transform![5],
+    height: Math.abs(item.height ?? item.transform![3]) || 1,
+  })).sort((a, b) => b.y - a.y || a.x - b.x || a.index - b.index);
+  const lines: Array<{ baseline: number; height: number; items: typeof positioned }> = [];
+  for (const entry of positioned) {
+    const line = lines.at(-1);
+    const tolerance = line ? Math.max(2, Math.min(6, Math.max(entry.height, line.height) * 0.45)) : 0;
+    if (line && Math.abs(line.baseline - entry.y) <= tolerance) {
+      line.items.push(entry);
+      line.baseline = (line.baseline * (line.items.length - 1) + entry.y) / line.items.length;
+      line.height = Math.max(line.height, entry.height);
+    } else {
+      lines.push({ baseline: entry.y, height: entry.height, items: [entry] });
+    }
+  }
+  return lines.flatMap((line) => line.items.sort((a, b) => a.x - b.x || a.index - b.index).map(({ item }) => item));
+}
+
 function makePageData(content: { items: unknown[] }): PageData {
-  const items = content.items.filter(
+  const extractedItems = content.items.filter(
     (item): item is TextItem => Boolean(item && typeof item === "object" && "str" in item),
   );
+  const items = orderItemsByPagePosition(extractedItems);
   let text = "";
   const itemRanges: Array<[number, number]> = [];
   items.forEach((item, index) => {
@@ -39,7 +64,199 @@ function makePageData(content: { items: unknown[] }): PageData {
     itemRanges.push([start, text.length]);
     if (index < items.length - 1) text += item.hasEOL ? "\n" : " ";
   });
-  return { text, sentences: splitSentences(text), itemRanges };
+  return { text, sentences: splitSentences(text), itemRanges, items };
+}
+
+type ReaderPageProps = {
+  pdf: any;
+  pageNumber: number;
+  maxWidth: number;
+  active: { page: number; sentence: number } | null;
+  cache: Map<number, PageData>;
+  stageRef: RefObject<HTMLDivElement | null>;
+  onPageData: (page: number, data: PageData) => void;
+  onStart: (page: number, sentence: number) => void;
+  onError: (message: string) => void;
+};
+
+function normalizeText(value: string) {
+  return value.normalize("NFC").replace(/[\s\u00a0]+/gu, " ").trim();
+}
+
+function ReaderPage({ pdf, pageNumber, maxWidth, active, cache, stageRef, onPageData, onStart, onError }: ReaderPageProps) {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const textLayerRef = useRef<HTMLDivElement>(null);
+  const highlightLayerRef = useRef<HTMLDivElement>(null);
+  const [layerVersion, setLayerVersion] = useState(0);
+  const pageDataRef = useRef<PageData | null>(null);
+  const itemSpansRef = useRef(new Map<number, HTMLSpanElement>());
+
+  useEffect(() => {
+    let cancelled = false;
+    let renderTask: { cancel: () => void } | null = null;
+    let textLayerTask: { cancel: () => void } | null = null;
+    async function renderPage() {
+      const canvas = canvasRef.current;
+      const layer = textLayerRef.current;
+      const highlightLayer = highlightLayerRef.current;
+      if (!pdf || !canvas || !layer || !highlightLayer) return;
+      try {
+        const pageProxy = await pdf.getPage(pageNumber);
+        if (cancelled) return;
+        const baseViewport = pageProxy.getViewport({ scale: 1 });
+        const viewport = pageProxy.getViewport({ scale: Math.min(1.8, maxWidth / baseViewport.width) });
+        const context = canvas.getContext("2d");
+        if (!context) throw new Error("This browser could not create a PDF canvas.");
+        const pixelRatio = window.devicePixelRatio || 1;
+        canvas.width = Math.floor(viewport.width * pixelRatio);
+        canvas.height = Math.floor(viewport.height * pixelRatio);
+        canvas.style.width = viewport.width + "px";
+        canvas.style.height = viewport.height + "px";
+        layer.replaceChildren();
+        layer.style.width = viewport.width + "px";
+        layer.style.height = viewport.height + "px";
+        highlightLayer.replaceChildren();
+        highlightLayer.style.width = viewport.width + "px";
+        highlightLayer.style.height = viewport.height + "px";
+        renderTask = pageProxy.render({
+          canvasContext: context,
+          viewport,
+          transform: pixelRatio === 1 ? null : [pixelRatio, 0, 0, pixelRatio, 0, 0],
+        });
+        await renderTask.promise;
+        if (cancelled) return;
+        const content = await pageProxy.getTextContent();
+        const data = makePageData(content);
+        cache.set(pageNumber, data);
+        pageDataRef.current = data;
+        onPageData(pageNumber, data);
+        textLayerTask = new TextLayer({ textContentSource: content, container: layer, viewport });
+        await textLayerTask.render();
+        if (cancelled) return;
+
+        const leafSpans = Array.from(layer.querySelectorAll<HTMLSpanElement>("span"))
+          .filter((span) => span.children.length === 0 && Boolean(span.textContent));
+        const spansByText = new Map<string, HTMLSpanElement[]>();
+        for (const span of leafSpans) {
+          const key = normalizeText(span.textContent ?? "");
+          const matches = spansByText.get(key) ?? [];
+          matches.push(span);
+          spansByText.set(key, matches);
+        }
+        const itemSpans = new Map<number, HTMLSpanElement>();
+        const usedSpans = new Set<HTMLSpanElement>();
+        const layerRect = layer.getBoundingClientRect();
+        for (let itemIndex = 0; itemIndex < data.items.length; itemIndex += 1) {
+          const item = data.items[itemIndex];
+          const candidates = (spansByText.get(normalizeText(item.str)) ?? []).filter((span) => !usedSpans.has(span));
+          if (!candidates.length) continue;
+          const target = item.transform
+            ? viewport.convertToViewportPoint(item.transform[4], item.transform[5])
+            : null;
+          const bestSpan = candidates.reduce((best, span) => {
+            if (!target) return best;
+            const rect = span.getBoundingClientRect();
+            const score = Math.abs(rect.left - layerRect.left - target[0]) + Math.abs(rect.bottom - layerRect.top - target[1]);
+            const bestRect = best.getBoundingClientRect();
+            const bestScore = Math.abs(bestRect.left - layerRect.left - target[0]) + Math.abs(bestRect.bottom - layerRect.top - target[1]);
+            return score < bestScore ? span : best;
+          }, candidates[0]);
+          itemSpans.set(itemIndex, bestSpan);
+          usedSpans.add(bestSpan);
+        }
+        itemSpansRef.current = itemSpans;
+        setLayerVersion((version) => version + 1);
+      } catch (error) {
+        if (!cancelled) onError(error instanceof Error ? error.message : "Could not render this PDF page.");
+      }
+    }
+    void renderPage();
+    return () => {
+      cancelled = true;
+      renderTask?.cancel();
+      textLayerTask?.cancel();
+    };
+  }, [pdf, pageNumber, maxWidth, cache, onPageData, onError]);
+
+  useEffect(() => {
+    const layer = textLayerRef.current;
+    const highlightLayer = highlightLayerRef.current;
+    const data = pageDataRef.current ?? cache.get(pageNumber) ?? null;
+    if (!layer || !highlightLayer) return;
+    highlightLayer.replaceChildren();
+    if (!data || active?.page !== pageNumber) return;
+    const sentence = data.sentences[active.sentence];
+    if (!sentence) return;
+    const layerRect = layer.getBoundingClientRect();
+    const firstRect = { top: Number.POSITIVE_INFINITY, bottom: Number.NEGATIVE_INFINITY };
+
+    for (const [itemIndex, [itemStart, itemEnd]] of data.itemRanges.entries()) {
+      const start = Math.max(sentence.start, itemStart) - itemStart;
+      const end = Math.min(sentence.end, itemEnd) - itemStart;
+      const itemSpan = itemSpansRef.current.get(itemIndex);
+      if (!itemSpan || start >= end) continue;
+      const walker = document.createTreeWalker(itemSpan, NodeFilter.SHOW_TEXT);
+      let textNode = walker.nextNode();
+      let offset = 0;
+      while (textNode) {
+        const length = textNode.textContent?.length ?? 0;
+        const rangeStart = Math.max(start, offset);
+        const rangeEnd = Math.min(end, offset + length);
+        if (rangeStart < rangeEnd) {
+          const range = document.createRange();
+          range.setStart(textNode, rangeStart - offset);
+          range.setEnd(textNode, rangeEnd - offset);
+          for (const rect of Array.from(range.getClientRects())) {
+            if (rect.width < 1 || rect.height < 1) continue;
+            const mark = document.createElement("span");
+            mark.className = "spoken-sentence-mark";
+            mark.style.left = rect.left - layerRect.left + "px";
+            mark.style.top = rect.top - layerRect.top + "px";
+            mark.style.width = rect.width + "px";
+            mark.style.height = rect.height + "px";
+            highlightLayer.append(mark);
+            firstRect.top = Math.min(firstRect.top, rect.top);
+            firstRect.bottom = Math.max(firstRect.bottom, rect.bottom);
+          }
+        }
+        offset += length;
+        textNode = walker.nextNode();
+      }
+    }
+
+    const stage = stageRef.current;
+    if (stage && Number.isFinite(firstRect.top)) {
+      const stageRect = stage.getBoundingClientRect();
+      const safeTop = stageRect.top + 22;
+      const safeBottom = stageRect.bottom - 22;
+      if (firstRect.top < safeTop || firstRect.bottom > safeBottom) {
+        const sentenceCenter = (firstRect.top + firstRect.bottom) / 2;
+        stage.scrollTo({ top: stage.scrollTop + sentenceCenter - (stageRect.top + stageRect.height * 0.42), behavior: "smooth" });
+      }
+    }
+  }, [active, cache, layerVersion, pageNumber, stageRef]);
+
+  function startFromClickedText(event: MouseEvent<HTMLDivElement>) {
+    const target = event.target;
+    if (!(target instanceof HTMLElement)) return;
+    const span = target.closest("span");
+    if (!span || !textLayerRef.current?.contains(span)) return;
+    const data = pageDataRef.current ?? cache.get(pageNumber);
+    if (!data) return;
+    const itemIndex = Array.from(itemSpansRef.current.entries()).find(([, itemSpan]) => itemSpan === span)?.[0];
+    const range = itemIndex === undefined ? null : data.itemRanges[itemIndex];
+    if (!range) return;
+    const sentenceIndex = data.sentences.findIndex((sentence) => range[0] < sentence.end && range[1] > sentence.start);
+    if (sentenceIndex >= 0) onStart(pageNumber, sentenceIndex);
+  }
+
+  return (
+    <div className="pdf-page">
+      <canvas ref={canvasRef} />
+      <div ref={highlightLayerRef} className="spoken-highlight-layer" aria-hidden="true" />
+      <div ref={textLayerRef} className="textLayer" onClick={startFromClickedText} />
+    </div>
+  );
 }
 
 function safeSpeed(value: number) {
@@ -57,6 +274,8 @@ function App() {
   const [documentId, setDocumentId] = useState("");
   const [pageNumber, setPageNumber] = useState(1);
   const [pageInput, setPageInput] = useState("1");
+  const [spreadView, setSpreadView] = useState(false);
+  const [stageWidth, setStageWidth] = useState(0);
   const [active, setActive] = useState<{ page: number; sentence: number } | null>(null);
   const [playerState, setPlayerState] = useState<PlayerState>("idle");
   const [message, setMessage] = useState("");
@@ -71,24 +290,24 @@ function App() {
   voiceRef.current = voice;
   speedRef.current = speed;
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  const textLayerRef = useRef<HTMLDivElement>(null);
   const pageContainerRef = useRef<HTMLDivElement>(null);
   const pageCache = useRef(new Map<number, PageData>());
-  const itemSpans = useRef<HTMLSpanElement[]>([]);
+  const [pageCacheVersion, setPageCacheVersion] = useState(0);
   const runId = useRef(0);
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const audioUrlRef = useRef<string | null>(null);
   const audioResolveRef = useRef<(() => void) | null>(null);
   const pausedRef = useRef(false);
   const resumePauseRef = useRef<(() => void) | null>(null);
-  const activeRef = useRef(active);
-  activeRef.current = active;
-
   const pageCount = pdf?.numPages ?? 0;
-  const currentPageData = pageCache.current.get(pageNumber);
-  const currentSentence = active?.page === pageNumber ? currentPageData?.sentences[active.sentence] : null;
+  const currentPageData = useMemo(() => pageCache.current.get(active?.page ?? pageNumber), [active?.page, pageNumber, pageCacheVersion]);
+  const currentSentence = active ? currentPageData?.sentences[active.sentence] : null;
   const progressKey = documentId ? "pagevoice-progress:" + documentId : "";
+
+  const onPageData = useCallback((page: number, data: PageData) => {
+    pageCache.current.set(page, data);
+    setPageCacheVersion((version) => version + 1);
+  }, []);
 
   const getPageData = useCallback(async (page: number): Promise<PageData> => {
     const cached = pageCache.current.get(page);
@@ -99,78 +318,20 @@ function App() {
     return data;
   }, [pdf]);
 
-  const highlightSpans = useCallback((activePage: number, sentenceIndex: number) => {
-    const layer = textLayerRef.current;
-    const data = pageCache.current.get(activePage);
-    if (!layer || !data) return;
-    const sentence = data.sentences[sentenceIndex];
-    const matchingSpans = itemSpans.current.filter((span, itemIndex) => {
-      const range = data.itemRanges[itemIndex];
-      const matches = Boolean(sentence && range && range[0] < sentence.end && range[1] > sentence.start);
-      span.classList.toggle("spoken-sentence", matches);
-      return matches;
-    });
-    matchingSpans[0]?.scrollIntoView({ block: "center", inline: "nearest", behavior: "smooth" });
-  }, []);
+  useEffect(() => {
+    const stage = pageContainerRef.current;
+    if (!pdf || !stage) return;
+    const measure = () => setStageWidth(stage.clientWidth);
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(stage);
+    return () => observer.disconnect();
+  }, [pdf]);
 
   useEffect(() => {
-    let cancelled = false;
-    let renderTask: { cancel: () => void } | null = null;
-    let textLayerTask: { cancel: () => void } | null = null;
-    async function renderPage() {
-      if (!pdf || !canvasRef.current || !textLayerRef.current || !pageContainerRef.current) return;
-      try {
-        const pageProxy = await pdf.getPage(pageNumber);
-        const container = pageContainerRef.current;
-        container.scrollTop = 0;
-        const baseViewport = pageProxy.getViewport({ scale: 1 });
-        const availableWidth = Math.max(320, container.clientWidth - 24);
-        const scale = Math.min(1.8, availableWidth / baseViewport.width);
-        const viewport = pageProxy.getViewport({ scale });
-        const canvas = canvasRef.current;
-        const context = canvas.getContext("2d");
-        if (!context) throw new Error("This browser could not create a PDF canvas.");
-        const pixelRatio = window.devicePixelRatio || 1;
-        canvas.width = Math.floor(viewport.width * pixelRatio);
-        canvas.height = Math.floor(viewport.height * pixelRatio);
-        canvas.style.width = viewport.width + "px";
-        canvas.style.height = viewport.height + "px";
-        const layer = textLayerRef.current;
-        layer.replaceChildren();
-        layer.style.width = viewport.width + "px";
-        layer.style.height = viewport.height + "px";
-        renderTask = pageProxy.render({
-          canvasContext: context,
-          viewport,
-          transform: pixelRatio === 1 ? null : [pixelRatio, 0, 0, pixelRatio, 0, 0],
-        });
-        await renderTask.promise;
-        if (cancelled) return;
-        const content = await pageProxy.getTextContent();
-        pageCache.current.set(pageNumber, makePageData(content));
-        textLayerTask = new TextLayer({ textContentSource: content, container: layer, viewport });
-        await textLayerTask.render();
-        if (cancelled) return;
-        const textItemCount = content.items.filter((item: unknown) => item && typeof item === "object" && "str" in item).length;
-        itemSpans.current = Array.from(layer.querySelectorAll<HTMLSpanElement>("span")).slice(0, textItemCount);
-        setPageInput(String(pageNumber));
-        const currentActive = activeRef.current;
-        if (currentActive?.page === pageNumber) highlightSpans(currentActive.page, currentActive.sentence);
-      } catch (error) {
-        if (!cancelled) setMessage(error instanceof Error ? error.message : "Could not render this PDF page.");
-      }
-    }
-    void renderPage();
-    return () => {
-      cancelled = true;
-      renderTask?.cancel();
-      textLayerTask?.cancel();
-    };
-  }, [pdf, pageNumber, highlightSpans]);
-
-  useEffect(() => {
-    if (active?.page === pageNumber) highlightSpans(active.page, active.sentence);
-  }, [active, pageNumber, highlightSpans]);
+    pageContainerRef.current?.scrollTo({ top: 0, behavior: "instant" });
+    setPageInput(String(pageNumber));
+  }, [pageNumber]);
 
   useEffect(() => {
     let alive = true;
@@ -262,6 +423,7 @@ function App() {
       setDocumentId(id);
       setPageNumber(restoredPage);
       setPageInput(String(restoredPage));
+      setPageCacheVersion((version) => version + 1);
       setActive(restoredSentence ? { page: restoredPage, sentence: restoredSentence } : null);
       setPlayerState("idle");
     } catch (error) {
@@ -302,7 +464,8 @@ function App() {
       for (let page = startPage; page <= pdf.numPages; page += 1) {
         const data = await getPageData(page);
         if (thisRun !== runId.current) return;
-        setPageNumber(page);
+        if (page !== startPage) setActive(null);
+        if (!spreadView || page < pageNumber || page > pageNumber + 1) setPageNumber(page);
         const firstSentence = page === startPage
           ? Math.min(Math.max(0, startSentence), Math.max(0, data.sentences.length - 1))
           : 0;
@@ -314,8 +477,6 @@ function App() {
         for (let index = firstSentence; index < data.sentences.length; index += 1) {
           if (thisRun !== runId.current) return;
           const sentence = data.sentences[index];
-          setActive({ page, sentence: index });
-          highlightSpans(page, index);
           const audioBlob = nextAudio ?? synthesize(sentence.text);
           const upcoming = index + 1 < data.sentences.length ? synthesize(data.sentences[index + 1].text) : null;
           const blob = await audioBlob;
@@ -335,6 +496,7 @@ function App() {
             };
             audioResolveRef.current = finish;
             audio.onended = finish;
+            audio.onplay = () => setActive({ page, sentence: index });
             audio.onerror = () => {
               audioResolveRef.current = null;
               reject(new Error("Audio playback failed."));
@@ -375,7 +537,7 @@ function App() {
       else setPlayerState("playing");
       return;
     }
-    const target = active?.page === pageNumber ? active : { page: pageNumber, sentence: 0 };
+    const target = active ?? { page: pageNumber, sentence: 0 };
     void playFrom(target.page, target.sentence);
   }
 
@@ -407,25 +569,19 @@ function App() {
     setActive(null);
   }
 
-  function startFromClickedText(event: MouseEvent<HTMLDivElement>) {
-    const target = event.target;
-    if (!(target instanceof HTMLElement)) return;
-    const span = target.closest("span");
-    if (!span || !textLayerRef.current?.contains(span)) return;
-    const itemIndex = itemSpans.current.indexOf(span as HTMLSpanElement);
-    const data = pageCache.current.get(pageNumber);
-    const range = data?.itemRanges[itemIndex];
-    if (!data || !range) return;
-    const sentenceIndex = data.sentences.findIndex((sentence) => range[0] < sentence.end && range[1] > sentence.start);
-    if (sentenceIndex >= 0) void playFrom(pageNumber, sentenceIndex);
-  }
-
   const statusText = useMemo(() => {
     if (modelReady === null) return "Checking local voice engine…";
     if (!modelReady) return "Local voice engine is not running";
     if (modelLoading) return "Loading local voice model…";
     return modelLoaded ? "Voice engine ready" : "Voice model loads on first play";
   }, [modelReady, modelLoaded, modelLoading]);
+
+  const visiblePages = pdf
+    ? Array.from({ length: spreadView ? Math.min(2, pageCount - pageNumber + 1) : 1 }, (_, index) => pageNumber + index)
+    : [];
+  const pageMaxWidth = stageWidth
+    ? Math.max(260, (stageWidth - (spreadView ? 64 : 40)) / (spreadView ? 2 : 1))
+    : 600;
 
   return (
     <main className="app-shell">
@@ -463,20 +619,27 @@ function App() {
               <div><p className="eyebrow">NOW READING</p><h1 title={fileName}>{fileName}</h1></div>
             </div>
             <div className="page-jump">
+              <div className="view-toggle" role="group" aria-label="Page layout">
+                <button className={!spreadView ? "selected" : ""} aria-pressed={!spreadView} onClick={() => setSpreadView(false)}>1 page</button>
+                <button className={spreadView ? "selected" : ""} aria-pressed={spreadView} onClick={() => setSpreadView(true)}>2 pages</button>
+              </div>
               <label htmlFor="page-number">Page</label>
               <input id="page-number" value={pageInput} inputMode="numeric"
                 onChange={(event) => setPageInput(event.target.value.replace(/\D/g, ""))}
                 onKeyDown={(event) => event.key === "Enter" && goToPage()} onBlur={goToPage}
                 aria-label="PDF page number" />
               <span>of {pageCount}</span>
-              <button aria-label="Previous page" disabled={pageNumber <= 1} onClick={() => { stopPlayback(); setPageNumber((page) => Math.max(1, page - 1)); }}>‹</button>
-              <button aria-label="Next page" disabled={pageNumber >= pageCount} onClick={() => { stopPlayback(); setPageNumber((page) => Math.min(pageCount, page + 1)); }}>›</button>
+              <button aria-label="Previous page" disabled={pageNumber <= 1} onClick={() => { stopPlayback(); setActive(null); setPageNumber((page) => Math.max(1, page - (spreadView ? 2 : 1))); }}>‹</button>
+              <button aria-label="Next page" disabled={pageNumber >= pageCount} onClick={() => { stopPlayback(); setActive(null); setPageNumber((page) => Math.min(pageCount, page + (spreadView ? 2 : 1))); }}>›</button>
             </div>
           </div>
           <div className="document-stage" ref={pageContainerRef}>
-            <div className="pdf-page">
-              <canvas ref={canvasRef} />
-              <div ref={textLayerRef} className="textLayer" onClick={startFromClickedText} />
+            <div className={"document-spread " + (spreadView ? "two-page" : "single-page")}>
+              {visiblePages.map((page) => (
+                <ReaderPage key={page} pdf={pdf} pageNumber={page} maxWidth={pageMaxWidth} active={active}
+                  cache={pageCache.current} stageRef={pageContainerRef} onPageData={onPageData}
+                  onStart={(targetPage, sentence) => void playFrom(targetPage, sentence)} onError={setMessage} />
+              ))}
             </div>
           </div>
           <div className="message-slot">
@@ -509,7 +672,6 @@ function App() {
               </label>
             </div>
           </footer>
-          <button className="change-file" onClick={() => fileInputRef.current?.click()}>Open another PDF</button>
         </section>
       )}
     </main>
